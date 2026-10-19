@@ -630,6 +630,181 @@ fn test_cross_contract_partial_repayment_lifecycle() {
     );
 }
 
+const PARTIAL_REPAYMENT_DEPOSIT: u128 = 12_000_000_000;
+
+fn setup_partial_repayment() -> (FeeLifecycle, BytesN<32>, u64) {
+    let lifecycle = setup_fee_lifecycle();
+    lifecycle
+        .pool
+        .deposit(&lifecycle.lp, &PARTIAL_REPAYMENT_DEPOSIT);
+    let (invoice_id, due_date) = create_fee_lifecycle_invoice(&lifecycle);
+    (lifecycle, invoice_id, due_date)
+}
+
+#[test]
+fn test_cross_contract_partial_repayment_zero_rejected_without_state_change() {
+    let (lifecycle, invoice_id, _) = setup_partial_repayment();
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let invoice_before = lifecycle.invoice.get(&invoice_id);
+    let stats_before = lifecycle.pool.get_stats();
+    let buyer_before = token.balance(&lifecycle.buyer);
+    let escrow_before = token.balance(&lifecycle.escrow_id);
+
+    assert!(lifecycle.invoice.try_repay_partial(&invoice_id, &0).is_err());
+
+    let invoice_after = lifecycle.invoice.get(&invoice_id);
+    let stats_after = lifecycle.pool.get_stats();
+    assert_eq!(invoice_after.status, invoice_before.status);
+    assert_eq!(invoice_after.repaid_amount, invoice_before.repaid_amount);
+    assert_eq!(
+        invoice_after.remaining_balance,
+        invoice_before.remaining_balance
+    );
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(stats_after.active_invoice_count, stats_before.active_invoice_count);
+    assert_eq!(stats_after.total_yield_distributed, stats_before.total_yield_distributed);
+    assert_eq!(token.balance(&lifecycle.buyer), buyer_before);
+    assert_eq!(token.balance(&lifecycle.escrow_id), escrow_before);
+}
+
+#[test]
+fn test_cross_contract_partial_repayment_minimum_stroop_accepted() {
+    let (lifecycle, invoice_id, _) = setup_partial_repayment();
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let invoice_before = lifecycle.invoice.get(&invoice_id);
+    let stats_before = lifecycle.pool.get_stats();
+
+    assert!(lifecycle.invoice.repay_partial(&invoice_id, &1));
+
+    let invoice_after = lifecycle.invoice.get(&invoice_id);
+    assert_eq!(invoice_after.status, InvoiceStatus::Confirmed);
+    assert_eq!(invoice_after.repaid_amount, 1);
+    assert_eq!(
+        invoice_after.remaining_balance,
+        invoice_before.face_value - 1
+    );
+    assert_eq!(
+        lifecycle.invoice.get_remaining_balance(&invoice_id),
+        invoice_before.face_value - 1
+    );
+
+    let stats_after = lifecycle.pool.get_stats();
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(stats_after.active_invoice_count, stats_before.active_invoice_count);
+    assert_eq!(stats_after.total_yield_distributed, stats_before.total_yield_distributed);
+    assert_eq!(
+        token.balance(&lifecycle.escrow_id),
+        invoice_before.funded_amount as i128 + 1
+    );
+}
+
+#[test]
+fn test_cross_contract_repeated_partial_repayments_track_invoice_and_pool() {
+    let (lifecycle, invoice_id, _) = setup_partial_repayment();
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let invoice_before = lifecycle.invoice.get(&invoice_id);
+    let stats_before = lifecycle.pool.get_stats();
+    let mut cumulative = 0u128;
+
+    for amount in [3_000_000_000u128, 2_000_000_000u128, 1_000_000_000u128] {
+        assert!(lifecycle.invoice.repay_partial(&invoice_id, &amount));
+        cumulative += amount;
+
+        let invoice_after = lifecycle.invoice.get(&invoice_id);
+        assert_eq!(invoice_after.status, InvoiceStatus::Confirmed);
+        assert_eq!(invoice_after.repaid_amount, cumulative);
+        assert_eq!(
+            invoice_after.remaining_balance,
+            invoice_before.face_value - cumulative
+        );
+        assert_eq!(
+            lifecycle.invoice.get_remaining_balance(&invoice_id),
+            invoice_before.face_value - cumulative
+        );
+
+        let stats_after = lifecycle.pool.get_stats();
+        assert_eq!(stats_after.total_funded, stats_before.total_funded);
+        assert_eq!(
+            stats_after.active_invoice_count,
+            stats_before.active_invoice_count
+        );
+        assert_eq!(
+            stats_after.total_yield_distributed,
+            stats_before.total_yield_distributed
+        );
+        assert_eq!(
+            token.balance(&lifecycle.escrow_id),
+            invoice_before.funded_amount as i128 + cumulative as i128
+        );
+    }
+}
+
+#[test]
+fn test_cross_contract_final_exact_balance_repayment_settles_invoice() {
+    let (lifecycle, invoice_id, due_date) = setup_partial_repayment();
+    lifecycle.env.ledger().set_timestamp(due_date);
+    let invoice_before = lifecycle.invoice.get(&invoice_id);
+    let discount = invoice_before.face_value - invoice_before.funded_amount;
+    let first_installment = 4_000_000_000u128;
+
+    assert!(lifecycle
+        .invoice
+        .repay_partial(&invoice_id, &first_installment));
+    let remaining = invoice_before.face_value - first_installment;
+    assert!(lifecycle.invoice.repay_partial(&invoice_id, &remaining));
+
+    let invoice_after = lifecycle.invoice.get(&invoice_id);
+    assert_eq!(invoice_after.status, InvoiceStatus::Repaid);
+    assert_eq!(invoice_after.remaining_balance, 0);
+    assert_eq!(invoice_after.repaid_amount, invoice_before.face_value);
+    assert!(invoice_after.repaid_at.is_some());
+
+    let stats_after = lifecycle.pool.get_stats();
+    assert_eq!(stats_after.total_funded, 0);
+    assert_eq!(stats_after.active_invoice_count, 0);
+    assert_eq!(stats_after.total_yield_distributed, discount);
+    assert_eq!(
+        stats_after.total_deposits,
+        PARTIAL_REPAYMENT_DEPOSIT + discount
+    );
+
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    assert_eq!(
+        token.balance(&lifecycle.escrow_id),
+        invoice_before.funded_amount as i128
+    );
+}
+
+#[test]
+fn test_cross_contract_partial_repayment_over_balance_rejected_without_state_change() {
+    let (lifecycle, invoice_id, _) = setup_partial_repayment();
+    let token = MockTokenClient::new(&lifecycle.env, &lifecycle.usdc_id);
+    let invoice_before = lifecycle.invoice.get(&invoice_id);
+    let stats_before = lifecycle.pool.get_stats();
+    let buyer_before = token.balance(&lifecycle.buyer);
+    let escrow_before = token.balance(&lifecycle.escrow_id);
+
+    let over_balance = invoice_before.remaining_balance + 1;
+    assert!(lifecycle
+        .invoice
+        .try_repay_partial(&invoice_id, &over_balance)
+        .is_err());
+
+    let invoice_after = lifecycle.invoice.get(&invoice_id);
+    let stats_after = lifecycle.pool.get_stats();
+    assert_eq!(invoice_after.status, invoice_before.status);
+    assert_eq!(invoice_after.repaid_amount, invoice_before.repaid_amount);
+    assert_eq!(
+        invoice_after.remaining_balance,
+        invoice_before.remaining_balance
+    );
+    assert_eq!(stats_after.total_funded, stats_before.total_funded);
+    assert_eq!(stats_after.active_invoice_count, stats_before.active_invoice_count);
+    assert_eq!(stats_after.total_yield_distributed, stats_before.total_yield_distributed);
+    assert_eq!(token.balance(&lifecycle.buyer), buyer_before);
+    assert_eq!(token.balance(&lifecycle.escrow_id), escrow_before);
+}
+
 #[test]
 #[should_panic(expected = "Contract re-entry is not allowed")]
 fn test_partial_repayment_then_default_lifecycle() {
