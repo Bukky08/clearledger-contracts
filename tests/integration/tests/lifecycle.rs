@@ -152,6 +152,146 @@ fn create_fee_lifecycle_invoice(lifecycle: &FeeLifecycle) -> (BytesN<32>, u64) {
     (invoice_id, due_date)
 }
 
+#[test]
+fn test_late_invalid_batch_create_rolls_back_counter_indexes_and_events() {
+    use soroban_sdk::{testutils::Events, vec};
+    let lifecycle = setup_fee_lifecycle();
+    lifecycle.env.budget().reset_unlimited();
+    let due = lifecycle.env.ledger().timestamp() + 30 * 86400;
+    let existing = lifecycle.invoice.create(
+        &lifecycle.issuer,
+        &lifecycle.buyer,
+        &1_000_000_000,
+        &due,
+        &lifecycle.usdc_id,
+    );
+    let before = lifecycle.invoice.get(&existing).to_xdr(&lifecycle.env);
+    let counts = lifecycle.invoice.get_counts().to_xdr(&lifecycle.env);
+    let issuer_count = lifecycle
+        .invoice
+        .get_invoice_count_by_issuer(&lifecycle.issuer);
+    let buyer_count = lifecycle
+        .invoice
+        .get_invoice_count_by_buyer(&lifecycle.buyer);
+    let counter: u64 = lifecycle.env.as_contract(&lifecycle.invoice.address, || {
+        lifecycle
+            .env
+            .storage()
+            .instance()
+            .get(&clearledger_invoice::DataKey::Counter)
+            .unwrap()
+    });
+    for invalid_kind in 0..3 {
+        let mut entries = soroban_sdk::Vec::new(&lifecycle.env);
+        for _ in 0..49 {
+            entries.push_back((
+                lifecycle.buyer.clone(),
+                1_000_000_000u128,
+                due,
+                lifecycle.usdc_id.clone(),
+            ));
+        }
+        let bad = match invalid_kind {
+            0 => (
+                lifecycle.buyer.clone(),
+                0u128,
+                due,
+                lifecycle.usdc_id.clone(),
+            ),
+            1 => (
+                lifecycle.buyer.clone(),
+                1_000_000_000u128,
+                lifecycle.env.ledger().timestamp(),
+                lifecycle.usdc_id.clone(),
+            ),
+            _ => (
+                lifecycle.buyer.clone(),
+                1_000_000_000u128,
+                due,
+                Address::generate(&lifecycle.env),
+            ),
+        };
+        entries.push_back(bad);
+        let event_count = lifecycle.env.events().all().len();
+        assert!(lifecycle
+            .invoice
+            .try_batch_create(&lifecycle.issuer, &entries)
+            .is_err());
+        assert_eq!(
+            lifecycle.invoice.get(&existing).to_xdr(&lifecycle.env),
+            before
+        );
+        assert_eq!(
+            lifecycle.invoice.get_counts().to_xdr(&lifecycle.env),
+            counts
+        );
+        assert_eq!(
+            lifecycle
+                .invoice
+                .get_invoice_count_by_issuer(&lifecycle.issuer),
+            issuer_count
+        );
+        assert_eq!(
+            lifecycle
+                .invoice
+                .get_invoice_count_by_buyer(&lifecycle.buyer),
+            buyer_count
+        );
+        assert_eq!(lifecycle.env.events().all().len(), event_count);
+        lifecycle.env.as_contract(&lifecycle.invoice.address, || {
+            assert_eq!(
+                lifecycle
+                    .env
+                    .storage()
+                    .instance()
+                    .get::<_, u64>(&clearledger_invoice::DataKey::Counter),
+                Some(counter)
+            );
+            assert!(!lifecycle.env.storage().persistent().has(
+                &clearledger_invoice::DataKey::IssuerIndexEntry(
+                    lifecycle.issuer.clone(),
+                    issuer_count
+                )
+            ));
+            assert!(!lifecycle.env.storage().persistent().has(
+                &clearledger_invoice::DataKey::BuyerIndexEntry(
+                    lifecycle.buyer.clone(),
+                    buyer_count
+                )
+            ));
+            assert!(!lifecycle.env.storage().persistent().has(
+                &clearledger_invoice::DataKey::StatusIndexEntry(
+                    InvoiceStatus::Created as u32,
+                    issuer_count
+                )
+            ));
+        });
+    }
+    // A valid retry proves failure did not poison the next slot or counter.
+    let valid = vec![
+        &lifecycle.env,
+        (
+            lifecycle.buyer.clone(),
+            1_000_000_000u128,
+            due,
+            lifecycle.usdc_id.clone(),
+        ),
+    ];
+    assert_eq!(
+        lifecycle
+            .invoice
+            .batch_create(&lifecycle.issuer, &valid)
+            .len(),
+        1
+    );
+    assert_eq!(
+        lifecycle
+            .invoice
+            .get_invoice_count_by_issuer(&lifecycle.issuer),
+        issuer_count + 1
+    );
+}
+
 struct FeeSettlementExpectation {
     shares: u128,
     deposit: u128,
@@ -187,7 +327,10 @@ fn assert_fee_settlement(lifecycle: &FeeLifecycle, expected: FeeSettlementExpect
     assert_eq!(token.balance(&lifecycle.escrow_id), 9_800_000_000);
 }
 
-fn expected_repayment_split(invoice: &clearledger_invoice::Invoice, repaid_at: u64) -> (u128, u128) {
+fn expected_repayment_split(
+    invoice: &clearledger_invoice::Invoice,
+    repaid_at: u64,
+) -> (u128, u128) {
     let funded_at = invoice
         .funded_at
         .expect("funded invoice should record its funding timestamp");
