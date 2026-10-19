@@ -187,85 +187,6 @@ fn assert_fee_settlement(lifecycle: &FeeLifecycle, expected: FeeSettlementExpect
     assert_eq!(token.balance(&lifecycle.escrow_id), 9_800_000_000);
 }
 
-/// Opt-in native-host measurements, not network fee estimates or a safe-size promise.
-#[test]
-#[ignore = "manual budget baseline; run with --ignored --nocapture"]
-fn measure_batch_create_budget_through_fifty_entries() {
-    use soroban_sdk::vec;
-    for size in [1u32, 10, 25, 50] {
-        let lifecycle = setup_fee_lifecycle();
-        let due = lifecycle.env.ledger().timestamp() + 30 * 86400;
-        let mut entries = soroban_sdk::Vec::new(&lifecycle.env);
-        for _ in 0..size {
-            entries.push_back((
-                lifecycle.buyer.clone(),
-                1_000_000_000u128,
-                due,
-                lifecycle.usdc_id.clone(),
-            ));
-        }
-        // Reset only after setup and input construction, so the reported total
-        // measures batch invocation rather than deployment/registry fixture work.
-        lifecycle.env.budget().reset_unlimited();
-        let ids = lifecycle.invoice.batch_create(&lifecycle.issuer, &entries);
-        let cpu = lifecycle.env.budget().cpu_instruction_cost();
-        let memory = lifecycle.env.budget().memory_bytes_cost();
-        std::println!("batch_create,size={size},cpu_instructions={cpu},memory_bytes={memory}");
-        assert_eq!(ids.len(), size);
-    }
-    for size in [1u32, 10, 25, 50] {
-        for buyers in [false, true] {
-            let lifecycle = setup_fee_lifecycle();
-            let registry_id = lifecycle.invoice.get_registry_contract().unwrap();
-            let registry = RegistryContractClient::new(&lifecycle.env, &registry_id);
-            let mut entries = soroban_sdk::Vec::new(&lifecycle.env);
-            for _ in 0..size {
-                entries.push_back((
-                    Address::generate(&lifecycle.env),
-                    Map::<String, String>::new(&lifecycle.env),
-                ));
-            }
-            lifecycle.env.budget().reset_unlimited();
-            let skipped = if buyers {
-                registry.batch_register_buyers(&entries)
-            } else {
-                registry.batch_register_issuers(&entries)
-            };
-            let cpu = lifecycle.env.budget().cpu_instruction_cost();
-            let memory = lifecycle.env.budget().memory_bytes_cost();
-            std::println!("registry_batch,buyers={buyers},size={size},cpu_instructions={cpu},memory_bytes={memory}");
-            assert!(skipped.is_empty());
-            let role = if buyers {
-                clearledger_registry::Role::Buyer
-            } else {
-                clearledger_registry::Role::Issuer
-            };
-            assert_eq!(registry.get_profile_count(&role), size + 1);
-        }
-    }
-    let lifecycle = setup_fee_lifecycle();
-    let entry = (
-        lifecycle.buyer.clone(),
-        1_000_000_000u128,
-        lifecycle.env.ledger().timestamp() + 30 * 86400,
-        lifecycle.usdc_id.clone(),
-    );
-    let mut oversized = vec![&lifecycle.env];
-    for _ in 0..51 {
-        oversized.push_back(entry.clone());
-    }
-    assert!(lifecycle
-        .invoice
-        .try_batch_create(&lifecycle.issuer, &oversized)
-        .is_err());
-    assert_eq!(
-        lifecycle
-            .invoice
-            .get_invoice_count_by_issuer(&lifecycle.issuer),
-        0
-    );
-}
-
 fn expected_repayment_split(
     invoice: &clearledger_invoice::Invoice,
     repaid_at: u64,
@@ -709,6 +630,85 @@ fn test_cross_contract_partial_repayment_lifecycle() {
     assert!(
         returned > deposit_amount,
         "LP must receive yield on top of deposit"
+    );
+}
+
+/// Opt-in native-host measurements, not network fee estimates or a safe-size promise.
+#[test]
+#[ignore = "manual budget baseline; run with --ignored --nocapture"]
+fn measure_batch_create_budget_through_fifty_entries() {
+    use soroban_sdk::vec;
+    for size in [1u32, 10, 25, 50] {
+        let lifecycle = setup_fee_lifecycle();
+        let due = lifecycle.env.ledger().timestamp() + 30 * 86400;
+        let mut entries = soroban_sdk::Vec::new(&lifecycle.env);
+        for _ in 0..size {
+            entries.push_back((
+                lifecycle.buyer.clone(),
+                1_000_000_000u128,
+                due,
+                lifecycle.usdc_id.clone(),
+            ));
+        }
+        // Reset only after setup and input construction, so the reported total
+        // measures batch invocation rather than deployment/registry fixture work.
+        lifecycle.env.budget().reset_unlimited();
+        let ids = lifecycle.invoice.batch_create(&lifecycle.issuer, &entries);
+        let cpu = lifecycle.env.budget().cpu_instruction_cost();
+        let memory = lifecycle.env.budget().memory_bytes_cost();
+        std::println!("batch_create,size={size},cpu_instructions={cpu},memory_bytes={memory}");
+        assert_eq!(ids.len(), size);
+    }
+    for size in [1u32, 10, 25, 50] {
+        for buyers in [false, true] {
+            let lifecycle = setup_fee_lifecycle();
+            let registry_id = lifecycle.invoice.get_registry_contract().unwrap();
+            let registry = RegistryContractClient::new(&lifecycle.env, &registry_id);
+            let mut entries = soroban_sdk::Vec::new(&lifecycle.env);
+            for _ in 0..size {
+                entries.push_back((
+                    Address::generate(&lifecycle.env),
+                    Map::<String, String>::new(&lifecycle.env),
+                ));
+            }
+            lifecycle.env.budget().reset_unlimited();
+            let skipped = if buyers {
+                registry.batch_register_buyers(&entries)
+            } else {
+                registry.batch_register_issuers(&entries)
+            };
+            let cpu = lifecycle.env.budget().cpu_instruction_cost();
+            let memory = lifecycle.env.budget().memory_bytes_cost();
+            std::println!("registry_batch,buyers={buyers},size={size},cpu_instructions={cpu},memory_bytes={memory}");
+            assert!(skipped.is_empty());
+            let role = if buyers {
+                clearledger_registry::Role::Buyer
+            } else {
+                clearledger_registry::Role::Issuer
+            };
+            assert_eq!(registry.get_profile_count(&role), size + 1);
+        }
+    }
+    let lifecycle = setup_fee_lifecycle();
+    let entry = (
+        lifecycle.buyer.clone(),
+        1_000_000_000u128,
+        lifecycle.env.ledger().timestamp() + 30 * 86400,
+        lifecycle.usdc_id.clone(),
+    );
+    let mut oversized = vec![&lifecycle.env];
+    for _ in 0..51 {
+        oversized.push_back(entry.clone());
+    }
+    assert!(lifecycle
+        .invoice
+        .try_batch_create(&lifecycle.issuer, &oversized)
+        .is_err());
+    assert_eq!(
+        lifecycle
+            .invoice
+            .get_invoice_count_by_issuer(&lifecycle.issuer),
+        0
     );
 }
 
